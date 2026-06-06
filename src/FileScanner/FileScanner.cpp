@@ -53,6 +53,7 @@ namespace {
     std::atomic<unsigned long long> g_totalSize(0);    // 扫描到的文件总大小（字节）
     std::atomic<unsigned long long> g_directories(0);  // 扫描到的目录总数
     std::atomic<unsigned long long> g_scanTimeMs(0);   // 扫描耗时（毫秒）
+    std::atomic<unsigned long long> g_processedDirs(0); // 已处理的目录数（用于判断扫描是否完成）
 
     // 扫描进度回调函数指针，用于通知调用者每个扫描到的文件信息
     ScanProgressCallback g_callback = nullptr;
@@ -369,6 +370,9 @@ namespace {
         // 关闭文件句柄
         FindClose(hFind);
         
+        // 增加已处理目录计数
+        g_processedDirs.fetch_add(1);
+        
         // 更新扫描耗时
         auto scanEnd = std::chrono::high_resolution_clock::now();
         t_totalScanTime += std::chrono::duration_cast<std::chrono::microseconds>(scanEnd - scanStart).count();
@@ -416,13 +420,15 @@ namespace {
                     
                     // 再次检查队列是否为空（可能被其他线程抢先取走）
                     if (g_directoryQueue.empty()) {
-                        // 如果队列为空，检查是否所有目录都已处理完
-                        // g_directories 记录的是总目录数，当处理完所有目录后应该退出
-                        // 这里通过检查队列是否持续为空来判断扫描是否完成
-                        // 如果队列为空且没有更多工作，可以认为扫描完成
-                        // 设置停止标志，让所有线程退出
-                        g_stopRequested.store(true);
-                        g_cv.notify_all();
+                        // 只有当所有目录都已处理完且队列为空时，才认为扫描完成
+                        // g_directories: 总目录数（包括已发现但未处理的）
+                        // g_processedDirs: 已处理的目录数
+                        // 当两者相等且队列为空时，表示所有目录都已扫描完毕
+                        if (g_processedDirs.load() >= g_directories.load()) {
+                            // 设置停止标志，让所有线程退出
+                            g_stopRequested.store(true);
+                            g_cv.notify_all();
+                        }
                         break;
                     }
                     
@@ -506,6 +512,7 @@ extern "C" {
         g_totalFiles.store(0);
         g_totalSize.store(0);
         g_directories.store(1);  // 根目录算一个
+        g_processedDirs.store(0); // 已处理目录数初始化为0
         g_scanTimeMs.store(0);
         g_callback = progressCallback;
         g_stopRequested.store(false);
