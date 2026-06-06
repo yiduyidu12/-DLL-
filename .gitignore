@@ -1,0 +1,32 @@
+# Visual Studio 相关
+.vs/
+*.suo
+*.user
+*.ncb
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+
+# 编译产物
+bin/
+obj/
+*.dll
+*.exe
+*.exp
+*.lib
+*.obj
+*.pdb
+
+# 日志和临时文件
+*.log
+*.tmp
+*.bak
+
+# Qt 相关
+moc_*.cpp
+ui_*.h
+qrc_*.cpp
+
+# 测试数据（每次运行脚本重新生成）
+__test_scan_data/

@@ -1,0 +1,10 @@
+LIBRARY "FileScanner"
+EXPORTS
+    StartScan @1
+    StopScan @2
+    GetScanSummary @3
+    IsScanning @4
+    GetScanError @5
+    PopScanError @6
+    GetErrorCount @7
+    StartScanEx @8
