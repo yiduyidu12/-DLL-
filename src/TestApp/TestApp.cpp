@@ -11,6 +11,9 @@
 #include <cstdio>
 #include "FileScanner.h"
 
+// 设置控制台输出编码为 UTF-8，支持中文输出
+#pragma execution_character_set("utf-8")
+
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "FileScanner.lib")
 
@@ -96,7 +99,7 @@ bool CALLBACK ScanProgress(const ScanResult& result) {
 
     // 更新状态标签
     WCHAR status[512];
-    swprintf_s(status, _countof(status), L"Scanning: %s", result.filePath.c_str());
+    swprintf_s(status, _countof(status), L"正在扫描: %s", result.filePath.c_str());
     SetWindowTextW(g_controls.hStatusLabel, status);
 
     // 处理消息队列，防止 UI 卡死
@@ -129,7 +132,7 @@ void UpdateResult() {
     // 显示汇总结果
     WCHAR result[512];
     swprintf_s(result, _countof(result),
-        L"Scan Complete:\r\nFiles: %llu\r\nFolders: %llu\r\nTotal Size: %s\r\nTime: %s",
+        L"扫描完成:\r\n文件数: %llu\r\n目录数: %llu\r\n总大小: %s\r\n耗时: %s",
         summary.totalFiles, summary.directories, sizeBuffer, timeBuffer);
     SetWindowTextW(g_controls.hResultLabel, result);
 }
@@ -155,7 +158,7 @@ void StartScanThread(PVOID param) {
     EnableWindow(g_controls.hPathEdit, FALSE);
 
     // 初始化 UI 状态
-    SetWindowTextW(g_controls.hStatusLabel, L"Scanning...");
+    SetWindowTextW(g_controls.hStatusLabel, L"正在扫描...");
     SendMessageW(g_controls.hFileList, LB_RESETCONTENT, 0, 0);
     SetWindowTextW(g_controls.hResultLabel, L"");
 
@@ -166,9 +169,9 @@ void StartScanThread(PVOID param) {
     if (!success) {
         wchar_t errorBuf[2048];
         if (GetScanError(errorBuf, 2048) && errorBuf[0]) {
-            MessageBoxW(g_controls.hWnd, errorBuf, L"Scan Error", MB_ICONERROR);
+            MessageBoxW(g_controls.hWnd, errorBuf, L"扫描错误", MB_ICONERROR);
         }
-        SetWindowTextW(g_controls.hStatusLabel, L"Scan Failed");
+        SetWindowTextW(g_controls.hStatusLabel, L"扫描失败");
         EnableWindow(g_controls.hStartBtn, TRUE);
         EnableWindow(g_controls.hStopBtn, FALSE);
         EnableWindow(g_controls.hBrowseBtn, TRUE);
@@ -190,7 +193,7 @@ void StartScanThread(PVOID param) {
 
     // 更新结果
     UpdateResult();
-    SetWindowTextW(g_controls.hStatusLabel, L"Scan Complete");
+    SetWindowTextW(g_controls.hStatusLabel, L"扫描完成");
 
     // 恢复按钮状态
     EnableWindow(g_controls.hStartBtn, TRUE);
@@ -215,7 +218,7 @@ void OnStopBtnClick() {
 // 打开文件夹选择对话框，用户选择后更新路径编辑框
 void OnBrowseBtnClick() {
     BROWSEINFOW bi = {0};
-    bi.lpszTitle = L"Select Folder";
+    bi.lpszTitle = L"选择文件夹";
     bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
 
     LPITEMIDLIST pidl = SHBrowseForFolderW(&bi);
@@ -244,25 +247,25 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SendMessageW(g_controls.hPathEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
 
             // 浏览按钮
-            g_controls.hBrowseBtn = CreateWindowW(L"BUTTON", L"Browse",
+            g_controls.hBrowseBtn = CreateWindowW(L"BUTTON", L"浏览",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                 420, 10, 80, 25, hwnd, (HMENU)IDC_BROWSE_BTN, NULL, NULL);
             SendMessageW(g_controls.hBrowseBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
 
             // 开始扫描按钮
-            g_controls.hStartBtn = CreateWindowW(L"BUTTON", L"Start Scan",
+            g_controls.hStartBtn = CreateWindowW(L"BUTTON", L"开始扫描",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                 10, 45, 100, 25, hwnd, (HMENU)IDC_START_BTN, NULL, NULL);
             SendMessageW(g_controls.hStartBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
 
             // 停止扫描按钮（初始禁用）
-            g_controls.hStopBtn = CreateWindowW(L"BUTTON", L"Stop Scan",
+            g_controls.hStopBtn = CreateWindowW(L"BUTTON", L"停止扫描",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_DISABLED,
                 120, 45, 100, 25, hwnd, (HMENU)IDC_STOP_BTN, NULL, NULL);
             SendMessageW(g_controls.hStopBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
 
             // 状态标签
-            g_controls.hStatusLabel = CreateWindowW(L"STATIC", L"Ready",
+            g_controls.hStatusLabel = CreateWindowW(L"STATIC", L"就绪",
                 WS_CHILD | WS_VISIBLE,
                 10, 80, 500, 20, hwnd, (HMENU)IDC_STATUS_LABEL, NULL, NULL);
             SendMessageW(g_controls.hStatusLabel, WM_SETFONT, (WPARAM)hFont, TRUE);
@@ -313,17 +316,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
 
     if (!RegisterClassExW(&wc)) {
-        MessageBoxW(NULL, L"Window registration failed", L"Error", MB_ICONERROR);
+        MessageBoxW(NULL, L"窗口注册失败", L"错误", MB_ICONERROR);
         return 1;
     }
 
     // 创建主窗口
-    g_controls.hWnd = CreateWindowExW(0, L"FileScannerTest", L"File Scanner",
+    g_controls.hWnd = CreateWindowExW(0, L"FileScannerTest", L"文件扫描器",
         WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX,
         CW_USEDEFAULT, CW_USEDEFAULT, 530, 500, NULL, NULL, hInstance, NULL);
 
     if (!g_controls.hWnd) {
-        MessageBoxW(NULL, L"Window creation failed", L"Error", MB_ICONERROR);
+        MessageBoxW(NULL, L"窗口创建失败", L"错误", MB_ICONERROR);
         return 1;
     }
 
