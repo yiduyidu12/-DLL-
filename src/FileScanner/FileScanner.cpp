@@ -416,7 +416,14 @@ namespace {
                     
                     // 再次检查队列是否为空（可能被其他线程抢先取走）
                     if (g_directoryQueue.empty()) {
-                        continue;
+                        // 如果队列为空，检查是否所有目录都已处理完
+                        // g_directories 记录的是总目录数，当处理完所有目录后应该退出
+                        // 这里通过检查队列是否持续为空来判断扫描是否完成
+                        // 如果队列为空且没有更多工作，可以认为扫描完成
+                        // 设置停止标志，让所有线程退出
+                        g_stopRequested.store(true);
+                        g_cv.notify_all();
+                        break;
                     }
                     
                     // 获取目录并从队列移除
