@@ -228,8 +228,8 @@ void OnStartBtnClick() {
         return;
     }
 
-    // 使用单线程扫描，方便观察可视化过程和测试停止按钮
-    SetMaxWorkerThreads(1);
+    // 多线程全速扫描
+    SetMaxWorkerThreads(0);
     BeginScanUi();
     _beginthread(StartScanThread, 0, NULL);
 }
@@ -241,7 +241,14 @@ void OnStopBtnClick() {
 
     EnableWindow(g_controls.hStopBtn, FALSE);
     g_acceptProgressUpdates.store(false, std::memory_order_release);
-    SetWindowTextW(g_controls.hStatusLabel, L"正在停止...");
+
+    // 先停定时器，截取当前统计快照，立即显示停止结果
+    KillTimer(g_controls.hWnd, TIMER_SCAN_UI);
+    RefreshScanUi();
+    UpdateResult(true);
+    SetWindowTextW(g_controls.hStatusLabel, L"扫描已停止");
+    g_scanUiActive.store(false, std::memory_order_release);
+
     StopScan();
 }
 
@@ -310,7 +317,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             break;
         }
         case WM_SCAN_COMPLETE: {
-            EndScanUi(wParam != 0);
+            // 仅自然扫描完成时处理，手动停止已在 OnStopBtnClick 中处理
+            if (g_scanUiActive.load(std::memory_order_acquire)) {
+                EndScanUi(wParam != 0);
+            } else {
+                // 手动停止后后台线程收尾，恢复按钮即可
+                EnableWindow(g_controls.hStopBtn, FALSE);
+                SetScanControlsEnabled(true);
+            }
             break;
         }
         case WM_SCAN_FAILED: {
