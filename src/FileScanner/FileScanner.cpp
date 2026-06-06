@@ -1,25 +1,19 @@
 // 多线程文件扫描 DLL 核心实现
-// ============================================================
-// 架构设计：
-//   采用生产者-消费者模型实现并行文件扫描
+// 架构设计：采用生产者-消费者模型实现并行文件扫描
 //   - WorkerThread（消费者）：从目录队列取目录，调用 ScanDirectory 扫描
 //   - ScanDirectory（生产者）：扫描目录发现子目录，将子目录重新入队
-//   
 // 线程同步机制：
 //   - std::atomic：用于计数器和状态标志（无锁，高性能）
 //   - std::mutex：保护共享数据结构（目录队列、错误队列、线程列表）
 //   - std::condition_variable：实现线程等待/唤醒机制
-//   
 // 性能优化策略：
 //   - 线程本地日志缓冲区：减少锁争用和文件 I/O
 //   - 原子操作：避免计数器的锁开销
 //   - 批量统计输出：每处理100个目录输出一次统计
-//   
 // 错误处理：
 //   - 错误队列：保存扫描过程中的错误信息
 //   - 异常捕获：捕获回调异常，不影响整体扫描
 //   - 资源清理：DLL卸载时主动停止扫描
-// ============================================================
 #include "FileScanner.h"
 #include "Filter.h"
 #include <windows.h>
@@ -40,8 +34,7 @@
 // 匿名命名空间：封装内部实现，限制符号链接性，避免外部访问
 namespace {
 
-    // ==================== 全局状态变量 ====================
-    
+    // 全局状态变量
     // 扫描状态标志：true 表示扫描正在进行中（原子操作，线程安全）
     std::atomic<bool> g_isScanning(false);
     
@@ -58,16 +51,14 @@ namespace {
     // 扫描进度回调函数指针，用于通知调用者每个扫描到的文件信息
     ScanProgressCallback g_callback = nullptr;
     
-    // ==================== 同步原语 ====================
-    
+    // 同步原语
     std::mutex g_mutex;           // 保护目录队列
     std::mutex g_errorMutex;      // 保护错误队列
     std::mutex g_logMutex;        // 保护日志文件写入
     std::mutex g_threadsMutex;    // 保护工作线程列表
     std::condition_variable g_cv; // 目录队列的条件变量（队列为空时阻塞等待）
     
-    // ==================== 数据结构 ====================
-    
+    // 数据结构
     std::queue<std::wstring> g_directoryQueue;  // 待扫描目录队列
     std::vector<std::thread> g_threads;         // 工作线程列表
     
@@ -88,8 +79,7 @@ namespace {
     std::thread g_completionThread;
     std::mutex g_completionMutex;  // 保护完成线程
 
-    // ==================== 辅助函数 ====================
-    
+    // 辅助函数
     // 获取当前线程ID的字符串表示
     std::wstring GetThreadIdString() {
         std::wstringstream ss;
@@ -97,10 +87,8 @@ namespace {
         return ss.str();
     }
 
-    // ==================== 线程本地日志缓冲区 ====================
-    // 设计目的：每个线程先写到本地 buffer，积累到一定数量后一次性刷到磁盘，
+    // 线程本地日志缓冲区：每个线程先写到本地 buffer，积累到一定数量后一次性刷到磁盘，
     // 大幅减少锁争用和文件 I/O 开销，提升高并发场景下的性能。
-    
     thread_local std::vector<std::wstring> t_logBuffer;  // 线程本地日志缓冲区
     static const size_t LOG_BUFFER_SIZE = 64;            // 缓冲区大小：64条
     
@@ -182,9 +170,7 @@ namespace {
         LOG(L"LastError set: " + error);
     }
 
-    // ==================== 线程本地性能统计 ====================
-    // 使用 thread_local 避免锁争用，每个线程独立统计，最后汇总
-    
+    // 线程本地性能统计：使用 thread_local 避免锁争用，每个线程独立统计，最后汇总
     thread_local unsigned long long t_totalScanTime = 0;  // 扫描总耗时（微秒）
     thread_local unsigned long long t_findFirstTime = 0;  // FindFirstFileW 耗时（微秒）
     thread_local unsigned long long t_findNextTime = 0;   // FindNextFileW 耗时（微秒）
@@ -193,8 +179,7 @@ namespace {
     thread_local unsigned long long t_dirProcessed = 0;   // 处理的目录数
     thread_local unsigned long long t_filesProcessed = 0; // 处理的文件数
 
-    // ==================== 核心扫描函数 ====================
-    
+    // 核心扫描函数
     // 扫描单个目录
     // 参数：dirPath-目录路径，threadId-线程ID（用于日志区分）
     void ScanDirectory(const std::wstring& dirPath, unsigned int threadId) {
@@ -392,8 +377,7 @@ namespace {
         }
     }
 
-    // ==================== 工作线程函数 ====================
-    
+    // 工作线程函数
     // 工作线程主循环
     // 参数：threadId-线程ID（用于日志区分）
     void WorkerThread(unsigned int threadId) {
@@ -458,13 +442,12 @@ namespace {
     }
 }
 
-// ==================== 导出函数实现 ====================
-
+// 导出函数实现
 extern "C" {
     // StartScan 和 StartScanEx 共享的初始化+线程启动逻辑
     static bool DoStartScan(const wchar_t* folderPath, ScanProgressCallback progressCallback,
                             const wchar_t* extensions, const wchar_t* excludeDirs) {
-        LOG(L"[StartScan] ========================================");
+        LOG(L"[StartScan] 开始扫描");
         LOG(L"[StartScan] 调用, path=[" + std::wstring(folderPath ? folderPath : L"null") + L"], callback=" + (progressCallback ? L"有效" : L"空"));
         LOG(L"[StartScan] 扩展名过滤=[" + std::wstring(extensions ? extensions : L"") + L"], 排除目录=[" + std::wstring(excludeDirs ? excludeDirs : L"") + L"]");
 
@@ -717,9 +700,7 @@ extern "C" {
     }
 }
 
-// ==================== DLL 入口函数 ====================
-
-// DLL 入口：处理加载和卸载事件
+// DLL 入口函数：处理加载和卸载事件
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
     switch (ul_reason_for_call) {
     case DLL_PROCESS_ATTACH:

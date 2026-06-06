@@ -20,8 +20,8 @@ int main() {
     // 设置控制台输出编码为 UTF-8，支持中文输出
     SetConsoleOutputCP(CP_UTF8);
 
-    // ========== 测试1：无过滤扫描 ==========
-    std::wcout << L"--- Test 1: 无过滤（全部文件通过） ---\n";
+    // 测试1：无过滤扫描
+    std::wcout << L"Test 1: 无过滤（全部文件通过）\n";
     int count = 0;
     
     // 使用 StartScan（无过滤版本），扫描前10个文件后停止
@@ -37,8 +37,8 @@ int main() {
     
     std::wcout << L"  扫描到 " << count << L" 个文件\n\n";
 
-    // ========== 测试2：按扩展名过滤 ==========
-    std::wcout << L"--- Test 2: 仅扫描 .bat 文件 ---\n";
+    // 测试2：按扩展名过滤
+    std::wcout << L"Test 2: 仅扫描 .bat 文件\n";
     count = 0;
     
     // 使用 StartScanEx，指定只扫描 .bat 文件
@@ -59,8 +59,8 @@ int main() {
     
     std::wcout << L"  总计 " << count << L" 个 .bat 文件\n\n";
 
-    // ========== 测试3：目录排除 ==========
-    std::wcout << L"--- Test 3: 排除 .vs 和 obj 目录 ---\n";
+    // 测试3：目录排除
+    std::wcout << L"Test 3: 排除 .vs 和 obj 目录\n";
     count = 0;
     
     // 使用 StartScanEx，排除指定目录
@@ -78,8 +78,8 @@ int main() {
     ScanSummary s = GetScanSummary();
     std::wcout << L"  文件数=" << s.totalFiles << L", 目录数=" << s.directories << L"\n\n";
 
-    // ========== 测试4：混合过滤 ==========
-    std::wcout << L"--- Test 4: 混合使用：仅 .cpp + .h，排除 .vs ---\n";
+    // 测试4：混合过滤
+    std::wcout << L"Test 4: 混合使用：仅 .cpp + .h，排除 .vs\n";
     count = 0;
     
     // 同时使用扩展名过滤和目录排除
