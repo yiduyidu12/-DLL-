@@ -19,6 +19,11 @@ link.exe /DLL /OUT:bin\Release\FileScanner.dll obj\FileScanner\Release\Filter.ob
 echo Build completed!
 copy /Y bin\Release\FileScanner.dll . >NUL
 copy /Y bin\Release\FileScanner.lib . >NUL
+
+echo Compiling TestApp...
+cl.exe /EHsc /O2 /utf-8 /Iinclude src\TestApp\TestApp.cpp /link /OUT:bin\Release\TestApp.exe user32.lib gdi32.lib comctl32.lib shell32.lib ole32.lib FileScanner.lib
+
+echo Build completed!
 dir /b bin\Release\FileScanner.dll
 
 endlocal

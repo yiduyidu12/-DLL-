@@ -45,8 +45,11 @@ extern "C" {
                                      const wchar_t* extensions, const wchar_t* excludeDirs);
 
     FILESCANNER_API void StopScan();
+    // 设置工作线程数，0 表示按 CPU 核心数自动；扫描开始前调用
+    FILESCANNER_API void SetMaxWorkerThreads(unsigned int threadCount);
     FILESCANNER_API ScanSummary GetScanSummary();
     FILESCANNER_API bool IsScanning();
+    FILESCANNER_API bool IsStopRequested();
     FILESCANNER_API bool GetScanError(wchar_t* buf, size_t bufSize);
     FILESCANNER_API bool PopScanError(wchar_t* buf, size_t bufSize);
     FILESCANNER_API int GetErrorCount();

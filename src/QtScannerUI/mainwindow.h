@@ -9,7 +9,9 @@
 
 #include <QMainWindow>
 #include <QThread>
+#include <QTimer>
 #include <atomic>
+#include <mutex>
 #include "FileScanner.h"
 
 QT_BEGIN_NAMESPACE
@@ -34,16 +36,28 @@ public slots:
     //   4. 轮询 IsScanning 等待扫描完成
     //   5. 发送扫描完成信号
     void doScan() {
-        // 重置停止标志
         stopRequested.store(false);
+        pendingFileCount.store(0, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(progressMutex);
+            latestFilePath.clear();
+            latestFileSize = 0;
+            latestLastModified = 0;
+        }
 
-        // 启动扫描，传入回调函数
         bool success = StartScan(scanPath.toStdWString().c_str(), [this](const ScanResult& result) {
-            // 通过信号发送文件信息到主线程
-            emit fileFound(QString::fromStdWString(result.filePath), result.fileSize, 
-                          result.lastModified, result.isDirectory);
-            // 检查是否请求停止
-            return !stopRequested.load();
+            if (stopRequested.load(std::memory_order_acquire)) {
+                return false;
+            }
+
+            pendingFileCount.fetch_add(1, std::memory_order_relaxed);
+            {
+                std::lock_guard<std::mutex> lock(progressMutex);
+                latestFilePath = QString::fromStdWString(result.filePath);
+                latestFileSize = result.fileSize;
+                latestLastModified = result.lastModified;
+            }
+            return true;
         });
 
         // 检查扫描是否成功启动
@@ -71,18 +85,27 @@ public slots:
 
     // 请求停止扫描
     void requestStop() {
-        stopRequested.store(true);
+        if (stopRequested.exchange(true)) {
+            return;
+        }
+        StopScan();
+    }
+
+    bool wasStopRequested() const {
+        return stopRequested.load(std::memory_order_acquire);
+    }
+
+    std::atomic<unsigned long long> pendingFileCount{0};
+
+    void getLatestProgress(QString& filePath, qulonglong& fileSize,
+                           unsigned long long& lastModified) const {
+        std::lock_guard<std::mutex> lock(progressMutex);
+        filePath = latestFilePath;
+        fileSize = latestFileSize;
+        lastModified = latestLastModified;
     }
 
 signals:
-    // 文件发现信号
-    // 参数 filePath: 文件路径
-    //       fileSize: 文件大小
-    //       lastModified: 最后修改时间
-    //       isDirectory: 是否为目录
-    void fileFound(const QString& filePath, qulonglong fileSize, 
-                   unsigned long long lastModified, bool isDirectory);
-    
     // 扫描完成信号
     // 参数 summary: 扫描汇总结果
     void scanComplete(const ScanSummary& summary);
@@ -92,8 +115,12 @@ signals:
     void scanError(const QString& error);
 
 private:
-    QString scanPath;              // 扫描路径
-    std::atomic<bool> stopRequested; // 停止请求标志
+    QString scanPath;
+    std::atomic<bool> stopRequested;
+    mutable std::mutex progressMutex;
+    QString latestFilePath;
+    qulonglong latestFileSize = 0;
+    unsigned long long latestLastModified = 0;
 };
 
 // 主窗口类
@@ -117,10 +144,9 @@ private slots:
     
     // 停止扫描按钮点击事件
     void onStopScan();
-    
-    // 文件发现事件（来自 ScanWorker）
-    void onFileFound(const QString& filePath, qulonglong fileSize, 
-                     unsigned long long lastModified, bool isDirectory);
+
+    // 定时刷新扫描进度
+    void refreshScanUi();
     
     // 扫描完成事件（来自 ScanWorker）
     void onScanComplete(const ScanSummary& summary);
@@ -132,10 +158,12 @@ private slots:
     void onWorkerFinished();
 
 private:
-    Ui::MainWindow *ui;          // UI 对象
-    QThread* scanThread = nullptr;   // 扫描线程
-    ScanWorker* scanWorker = nullptr; // 扫描工作对象
-    QString formatSize(qulonglong size) const; // 格式化文件大小
+    Ui::MainWindow *ui;
+    QThread* scanThread = nullptr;
+    ScanWorker* scanWorker = nullptr;
+    QTimer* scanUiTimer = nullptr;
+    unsigned long long lastListSampleCount = 0;
+    QString formatSize(qulonglong size) const;
 };
 
 #endif // MAINWINDOW_H

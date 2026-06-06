@@ -9,42 +9,55 @@
 #include <process.h>
 #include <tchar.h>
 #include <cstdio>
+#include <atomic>
 #include "FileScanner.h"
 
-// 设置控制台输出编码为 UTF-8，支持中文输出
 #pragma execution_character_set("utf-8")
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "FileScanner.lib")
 
-// 控件 ID 定义
-#define IDC_PATH_EDIT 1001      // 路径编辑框
-#define IDC_BROWSE_BTN 1002     // 浏览按钮
-#define IDC_START_BTN 1003      // 开始扫描按钮
-#define IDC_STOP_BTN 1004       // 停止扫描按钮
-#define IDC_STATUS_LABEL 1005   // 状态标签
-#define IDC_FILE_LIST 1006      // 文件列表框
-#define IDC_RESULT_LABEL 1007   // 结果标签
+#define IDC_PATH_EDIT 1001
+#define IDC_BROWSE_BTN 1002
+#define IDC_START_BTN 1003
+#define IDC_STOP_BTN 1004
+#define IDC_STATUS_LABEL 1005
+#define IDC_FILE_LIST 1006
+#define IDC_RESULT_LABEL 1007
+#define TIMER_SCAN_UI 1
 
-// 应用程序控件集合
+#define WM_SCAN_COMPLETE (WM_USER + 4)
+#define WM_SCAN_FAILED (WM_USER + 5)
+
 struct AppControls {
-    HWND hWnd;              // 主窗口句柄
-    HWND hPathEdit;         // 路径编辑框
-    HWND hBrowseBtn;        // 浏览按钮
-    HWND hStartBtn;         // 开始扫描按钮
-    HWND hStopBtn;          // 停止扫描按钮
-    HWND hStatusLabel;      // 状态标签
-    HWND hFileList;         // 文件列表框
-    HWND hResultLabel;      // 结果标签
+    HWND hWnd;
+    HWND hPathEdit;
+    HWND hBrowseBtn;
+    HWND hStartBtn;
+    HWND hStopBtn;
+    HWND hStatusLabel;
+    HWND hFileList;
+    HWND hResultLabel;
 };
 
-// 全局控件对象
 AppControls g_controls = {0};
 
-// 格式化文件大小为可读字符串
-// 参数 size: 文件大小（字节）
-//       buffer: 输出缓冲区
-//       bufferSize: 缓冲区大小
+static const UINT SCAN_UI_TIMER_MS = 50;
+static const int MAX_LIST_ITEMS = 500;
+static std::atomic<bool> g_acceptProgressUpdates(true);
+static std::atomic<bool> g_scanUiActive(false);
+static std::atomic<unsigned long long> g_scannedFileCount(0);
+// 环形缓冲区，回调线程写入，UI 定时器批量读取
+static const int RING_SIZE = 128;
+struct FileEntry {
+    wchar_t path[MAX_PATH];
+    unsigned long long size;
+    unsigned long long modified;
+};
+static FileEntry g_fileRing[RING_SIZE];
+static std::atomic<int> g_ringWrite(0);
+static std::atomic<int> g_ringRead(0);
+
 void FormatFileSize(unsigned long long size, WCHAR* buffer, size_t bufferSize) {
     if (size < 1024) {
         swprintf_s(buffer, bufferSize, L"%llu B", size);
@@ -57,10 +70,6 @@ void FormatFileSize(unsigned long long size, WCHAR* buffer, size_t bufferSize) {
     }
 }
 
-// FILETIME 转可读时间字符串，格式 YYYY-MM-DD HH:MM
-// 参数 ft: FILETIME 格式的时间戳（64位整数）
-//       buffer: 输出缓冲区
-//       bufferSize: 缓冲区大小
 void FormatFileTime(unsigned long long ft, WCHAR* buffer, size_t bufferSize) {
     if (ft == 0) { swprintf_s(buffer, bufferSize, L"---"); return; }
     FILETIME fileTime;
@@ -73,55 +82,76 @@ void FormatFileTime(unsigned long long ft, WCHAR* buffer, size_t bufferSize) {
         stLocal.wYear, stLocal.wMonth, stLocal.wDay, stLocal.wHour, stLocal.wMinute);
 }
 
-// 扫描进度回调，每个文件扫描到时调用
-// 参数 result: 扫描结果结构体，包含文件路径、大小、修改时间等信息
-// 返回: true 继续扫描，false 停止扫描
-// 注意: 使用 PeekMessage 防止 UI 卡死
 bool CALLBACK ScanProgress(const ScanResult& result) {
-    // 格式化文件大小
-    WCHAR sizeBuffer[64];
-    FormatFileSize(result.fileSize, sizeBuffer, _countof(sizeBuffer));
+    if (IsStopRequested() || !g_acceptProgressUpdates.load(std::memory_order_acquire)) {
+        return false;
+    }
 
-    // 格式化文件修改时间
-    WCHAR timeBuffer[32];
-    FormatFileTime(result.lastModified, timeBuffer, _countof(timeBuffer));
+    g_scannedFileCount.fetch_add(1, std::memory_order_relaxed);
 
-    // 添加到文件列表
-    WCHAR itemText[MAX_PATH + 100];
-    swprintf_s(itemText, _countof(itemText), L"%s - %s - %s", timeBuffer, sizeBuffer, result.filePath.c_str());
-    SendMessageW(g_controls.hFileList, LB_ADDSTRING, 0, (LPARAM)itemText);
+    // 写入环形缓冲区（无锁 CAS 分配槽位）
+    int idx = g_ringWrite.fetch_add(1, std::memory_order_acq_rel) % RING_SIZE;
+    FileEntry& entry = g_fileRing[idx];
+    wcsncpy_s(entry.path, _countof(entry.path), result.filePath.c_str(), _TRUNCATE);
+    entry.size = result.fileSize;
+    entry.modified = result.lastModified;
 
-    // 滚动到最新项
+    return true;
+}
+
+void RefreshScanUi() {
+    unsigned long long fileCount = g_scannedFileCount.load(std::memory_order_relaxed);
+
+    // 批量从环形缓冲区读取并追加到列表
+    unsigned long long appended = 0;
+    int readPos = g_ringRead.load(std::memory_order_acquire);
+    int writePos = g_ringWrite.load(std::memory_order_acquire);
+    while (readPos < writePos) {
+        int idx = readPos % RING_SIZE;
+        FileEntry& entry = g_fileRing[idx];
+        if (entry.path[0] == L'\0') { ++readPos; continue; }
+
+        WCHAR sizeBuffer[64];
+        FormatFileSize(entry.size, sizeBuffer, _countof(sizeBuffer));
+        WCHAR timeBuffer[32];
+        FormatFileTime(entry.modified, timeBuffer, _countof(timeBuffer));
+        WCHAR itemText[MAX_PATH + 100];
+        swprintf_s(itemText, _countof(itemText), L"%s - %s - %s", timeBuffer, sizeBuffer, entry.path);
+        SendMessageW(g_controls.hFileList, LB_ADDSTRING, 0, (LPARAM)itemText);
+        appended++;
+        ++readPos;
+
+        // 每次最多追加 200 条，避免单次刷新卡 UI
+        if (appended >= 200) break;
+    }
+    g_ringRead.store(readPos, std::memory_order_release);
+
+    // 清理超出列表上限的旧条目
     int count = SendMessageW(g_controls.hFileList, LB_GETCOUNT, 0, 0);
+    while (count > MAX_LIST_ITEMS) {
+        SendMessageW(g_controls.hFileList, LB_DELETESTRING, 0, 0);
+        --count;
+    }
     if (count > 0) {
         SendMessageW(g_controls.hFileList, LB_SETTOPINDEX, count - 1, 0);
     }
 
     // 更新状态标签
     WCHAR status[512];
-    swprintf_s(status, _countof(status), L"正在扫描: %s", result.filePath.c_str());
-    SetWindowTextW(g_controls.hStatusLabel, status);
-
-    // 处理消息队列，防止 UI 卡死
-    MSG msg;
-    while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
+    if (fileCount == 0) {
+        swprintf_s(status, _countof(status), L"正在扫描...");
+    } else {
+        swprintf_s(status, _countof(status), L"正在扫描: 已发现 %llu 个文件", fileCount);
     }
-
-    return true;
+    SetWindowTextW(g_controls.hStatusLabel, status);
 }
 
-// 更新扫描结果标签
-// 显示文件数、目录数、总大小、耗时等信息
-void UpdateResult() {
+void UpdateResult(bool stopped) {
     ScanSummary summary = GetScanSummary();
 
-    // 格式化总大小
     WCHAR sizeBuffer[64];
     FormatFileSize(summary.totalSize, sizeBuffer, _countof(sizeBuffer));
 
-    // 格式化耗时
     WCHAR timeBuffer[32];
     if (summary.scanTimeMs < 1000) {
         swprintf_s(timeBuffer, _countof(timeBuffer), L"%llu ms", summary.scanTimeMs);
@@ -129,93 +159,92 @@ void UpdateResult() {
         swprintf_s(timeBuffer, _countof(timeBuffer), L"%.2f sec", summary.scanTimeMs / 1000.0);
     }
 
-    // 显示汇总结果
     WCHAR result[512];
     swprintf_s(result, _countof(result),
-        L"扫描完成:\r\n文件数: %llu\r\n目录数: %llu\r\n总大小: %s\r\n耗时: %s",
+        L"%s\r\n文件数: %llu\r\n目录数: %llu\r\n总大小: %s\r\n耗时: %s",
+        stopped ? L"扫描已停止:" : L"扫描完成:",
         summary.totalFiles, summary.directories, sizeBuffer, timeBuffer);
     SetWindowTextW(g_controls.hResultLabel, result);
 }
 
-// 扫描线程函数
-// 参数 param: 未使用
-// 流程:
-//   1. 获取用户输入的扫描路径
-//   2. 禁用开始/浏览按钮，启用停止按钮
-//   3. 调用 StartScan 启动扫描
-//   4. 轮询 IsScanning 等待扫描完成
-//   5. 更新结果显示
-//   6. 恢复按钮状态
-void StartScanThread(PVOID param) {
-    // 获取扫描路径
-    WCHAR path[MAX_PATH];
-    GetWindowTextW(g_controls.hPathEdit, path, MAX_PATH);
+void SetScanControlsEnabled(bool enabled) {
+    EnableWindow(g_controls.hStartBtn, enabled ? TRUE : FALSE);
+    EnableWindow(g_controls.hBrowseBtn, enabled ? TRUE : FALSE);
+    EnableWindow(g_controls.hPathEdit, enabled ? TRUE : FALSE);
+}
 
-    // 禁用开始/浏览按钮，启用停止按钮
-    EnableWindow(g_controls.hStartBtn, FALSE);
+void BeginScanUi() {
+    g_acceptProgressUpdates.store(true, std::memory_order_release);
+    g_scannedFileCount.store(0, std::memory_order_relaxed);
+    g_ringWrite.store(0, std::memory_order_release);
+    g_ringRead.store(0, std::memory_order_release);
+    ZeroMemory(g_fileRing, sizeof(g_fileRing));
+
+    SetScanControlsEnabled(false);
     EnableWindow(g_controls.hStopBtn, TRUE);
-    EnableWindow(g_controls.hBrowseBtn, FALSE);
-    EnableWindow(g_controls.hPathEdit, FALSE);
-
-    // 初始化 UI 状态
-    SetWindowTextW(g_controls.hStatusLabel, L"正在扫描...");
+    SetWindowTextW(g_controls.hStatusLabel, L"正在扫描...（可按 Esc 停止）");
     SendMessageW(g_controls.hFileList, LB_RESETCONTENT, 0, 0);
     SetWindowTextW(g_controls.hResultLabel, L"");
 
-    // 启动扫描
-    bool success = StartScan(path, ScanProgress);
+    g_scanUiActive.store(true, std::memory_order_release);
+    SetTimer(g_controls.hWnd, TIMER_SCAN_UI, SCAN_UI_TIMER_MS, NULL);
+    RefreshScanUi();
+}
 
-    // 检查扫描是否成功启动
+void EndScanUi(bool stopped) {
+    g_scanUiActive.store(false, std::memory_order_release);
+    KillTimer(g_controls.hWnd, TIMER_SCAN_UI);
+    RefreshScanUi();
+    UpdateResult(stopped);
+    SetWindowTextW(g_controls.hStatusLabel, stopped ? L"扫描已停止" : L"扫描完成");
+    EnableWindow(g_controls.hStopBtn, FALSE);
+    SetScanControlsEnabled(true);
+}
+
+void StartScanThread(PVOID param) {
+    (void)param;
+
+    WCHAR path[MAX_PATH];
+    GetWindowTextW(g_controls.hPathEdit, path, MAX_PATH);
+
+    bool success = StartScan(path, ScanProgress);
     if (!success) {
-        wchar_t errorBuf[2048];
-        if (GetScanError(errorBuf, 2048) && errorBuf[0]) {
-            MessageBoxW(g_controls.hWnd, errorBuf, L"扫描错误", MB_ICONERROR);
-        }
-        SetWindowTextW(g_controls.hStatusLabel, L"扫描失败");
-        EnableWindow(g_controls.hStartBtn, TRUE);
-        EnableWindow(g_controls.hStopBtn, FALSE);
-        EnableWindow(g_controls.hBrowseBtn, TRUE);
-        EnableWindow(g_controls.hPathEdit, TRUE);
+        PostMessageW(g_controls.hWnd, WM_SCAN_FAILED, 0, 0);
         _endthread();
         return;
     }
 
-    // 等待扫描完成
     while (IsScanning()) {
-        Sleep(50);
-        // 处理消息队列，防止 UI 卡死
-        MSG msg;
-        while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
-        }
+        Sleep(20);
     }
 
-    // 更新结果
-    UpdateResult();
-    SetWindowTextW(g_controls.hStatusLabel, L"扫描完成");
-
-    // 恢复按钮状态
-    EnableWindow(g_controls.hStartBtn, TRUE);
-    EnableWindow(g_controls.hStopBtn, FALSE);
-    EnableWindow(g_controls.hBrowseBtn, TRUE);
-    EnableWindow(g_controls.hPathEdit, TRUE);
-
+    const BOOL stopped = IsStopRequested() ? TRUE : FALSE;
+    PostMessageW(g_controls.hWnd, WM_SCAN_COMPLETE, stopped, 0);
     _endthread();
 }
 
-// 开始扫描按钮点击事件处理
 void OnStartBtnClick() {
+    if (IsScanning() || g_scanUiActive.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    // 使用单线程扫描，方便观察可视化过程和测试停止按钮
+    SetMaxWorkerThreads(1);
+    BeginScanUi();
     _beginthread(StartScanThread, 0, NULL);
 }
 
-// 停止扫描按钮点击事件处理
 void OnStopBtnClick() {
+    if (!IsScanning() && !g_scanUiActive.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    EnableWindow(g_controls.hStopBtn, FALSE);
+    g_acceptProgressUpdates.store(false, std::memory_order_release);
+    SetWindowTextW(g_controls.hStatusLabel, L"正在停止...");
     StopScan();
 }
 
-// 浏览按钮点击事件处理
-// 打开文件夹选择对话框，用户选择后更新路径编辑框
 void OnBrowseBtnClick() {
     BROWSEINFOW bi = {0};
     bi.lpszTitle = L"选择文件夹";
@@ -231,52 +260,42 @@ void OnBrowseBtnClick() {
     }
 }
 
-// 窗口过程函数
-// 处理窗口消息
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE: {
-            // 创建窗口时初始化所有控件
             HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
             g_controls.hWnd = hwnd;
 
-            // 路径编辑框
             g_controls.hPathEdit = CreateWindowW(L"EDIT", L"",
                 WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
                 10, 10, 400, 25, hwnd, (HMENU)IDC_PATH_EDIT, NULL, NULL);
             SendMessageW(g_controls.hPathEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
 
-            // 浏览按钮
             g_controls.hBrowseBtn = CreateWindowW(L"BUTTON", L"浏览",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                 420, 10, 80, 25, hwnd, (HMENU)IDC_BROWSE_BTN, NULL, NULL);
             SendMessageW(g_controls.hBrowseBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
 
-            // 开始扫描按钮
             g_controls.hStartBtn = CreateWindowW(L"BUTTON", L"开始扫描",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                 10, 45, 100, 25, hwnd, (HMENU)IDC_START_BTN, NULL, NULL);
             SendMessageW(g_controls.hStartBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
 
-            // 停止扫描按钮（初始禁用）
             g_controls.hStopBtn = CreateWindowW(L"BUTTON", L"停止扫描",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_DISABLED,
                 120, 45, 100, 25, hwnd, (HMENU)IDC_STOP_BTN, NULL, NULL);
             SendMessageW(g_controls.hStopBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
 
-            // 状态标签
             g_controls.hStatusLabel = CreateWindowW(L"STATIC", L"就绪",
                 WS_CHILD | WS_VISIBLE,
                 10, 80, 500, 20, hwnd, (HMENU)IDC_STATUS_LABEL, NULL, NULL);
             SendMessageW(g_controls.hStatusLabel, WM_SETFONT, (WPARAM)hFont, TRUE);
 
-            // 文件列表框
             g_controls.hFileList = CreateWindowW(L"LISTBOX", L"",
-                WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | LBS_NOINTEGRALHEIGHT | LBS_WANTKEYBOARDINPUT,
+                WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | LBS_NOINTEGRALHEIGHT,
                 10, 110, 500, 250, hwnd, (HMENU)IDC_FILE_LIST, NULL, NULL);
             SendMessageW(g_controls.hFileList, WM_SETFONT, (WPARAM)hFont, TRUE);
 
-            // 结果标签
             g_controls.hResultLabel = CreateWindowW(L"STATIC", L"",
                 WS_CHILD | WS_VISIBLE | SS_LEFT,
                 10, 375, 500, 80, hwnd, (HMENU)IDC_RESULT_LABEL, NULL, NULL);
@@ -284,8 +303,29 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
             break;
         }
+        case WM_TIMER: {
+            if (wParam == TIMER_SCAN_UI && g_scanUiActive.load(std::memory_order_acquire)) {
+                RefreshScanUi();
+            }
+            break;
+        }
+        case WM_SCAN_COMPLETE: {
+            EndScanUi(wParam != 0);
+            break;
+        }
+        case WM_SCAN_FAILED: {
+            g_scanUiActive.store(false, std::memory_order_release);
+            KillTimer(hwnd, TIMER_SCAN_UI);
+            wchar_t errorBuf[2048];
+            if (GetScanError(errorBuf, 2048) && errorBuf[0]) {
+                MessageBoxW(hwnd, errorBuf, L"扫描错误", MB_ICONERROR);
+            }
+            SetWindowTextW(g_controls.hStatusLabel, L"扫描失败");
+            EnableWindow(g_controls.hStopBtn, FALSE);
+            SetScanControlsEnabled(true);
+            break;
+        }
         case WM_COMMAND: {
-            // 处理按钮点击事件
             switch (LOWORD(wParam)) {
                 case IDC_START_BTN:  OnStartBtnClick();  break;
                 case IDC_STOP_BTN:   OnStopBtnClick();   break;
@@ -294,7 +334,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             break;
         }
         case WM_DESTROY:
-            // 窗口销毁时停止扫描
+            KillTimer(hwnd, TIMER_SCAN_UI);
             StopScan();
             PostQuitMessage(0);
             break;
@@ -304,9 +344,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return 0;
 }
 
-// 程序入口点
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
-    // 注册窗口类
     WNDCLASSEXW wc = {0};
     wc.cbSize = sizeof(WNDCLASSEX);
     wc.lpfnWndProc = WndProc;
@@ -320,7 +358,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
 
-    // 创建主窗口
     g_controls.hWnd = CreateWindowExW(0, L"FileScannerTest", L"文件扫描器",
         WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX,
         CW_USEDEFAULT, CW_USEDEFAULT, 530, 500, NULL, NULL, hInstance, NULL);
@@ -330,13 +367,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
 
-    // 显示窗口
     ShowWindow(g_controls.hWnd, nCmdShow);
     UpdateWindow(g_controls.hWnd);
 
-    // 消息循环
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0)) {
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE &&
+            (IsScanning() || g_scanUiActive.load(std::memory_order_acquire))) {
+            OnStopBtnClick();
+            continue;
+        }
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }

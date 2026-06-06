@@ -50,6 +50,9 @@ namespace {
 
     // 扫描进度回调函数指针，用于通知调用者每个扫描到的文件信息
     ScanProgressCallback g_callback = nullptr;
+
+    // 工作线程数上限，0 表示按 CPU 核心数自动
+    std::atomic<unsigned int> g_maxWorkerThreads(0);
     
     // 同步原语
     std::mutex g_mutex;           // 保护目录队列
@@ -179,6 +182,13 @@ namespace {
     thread_local unsigned long long t_dirProcessed = 0;   // 处理的目录数
     thread_local unsigned long long t_filesProcessed = 0; // 处理的文件数
 
+    // 协作式停止检查函数
+    // 统一检查停止标志，提供一致的停止行为
+    // 返回 true 表示应该停止扫描
+    inline bool ShouldStop() {
+        return g_stopRequested.load(std::memory_order_acquire);
+    }
+
     // 核心扫描函数
     // 扫描单个目录
     // 参数：dirPath-目录路径，threadId-线程ID（用于日志区分）
@@ -221,8 +231,8 @@ namespace {
         try {
             // 遍历目录中的所有条目
             do {
-                // 检查是否需要停止扫描
-                if (g_stopRequested.load()) {
+                // 协作式停止检查：在处理每个条目前检查
+                if (ShouldStop()) {
                     break;
                 }
                 
@@ -234,6 +244,8 @@ namespace {
                     if (!FindNextFileW(hFind, &findData)) break;
                     auto nextEnd = std::chrono::high_resolution_clock::now();
                     t_findNextTime += std::chrono::duration_cast<std::chrono::microseconds>(nextEnd - nextStart).count();
+                    // 协作式停止检查
+                    if (ShouldStop()) break;
                     continue;
                 }
 
@@ -247,6 +259,8 @@ namespace {
                     if (!FindNextFileW(hFind, &findData)) break;
                     auto nextEnd = std::chrono::high_resolution_clock::now();
                     t_findNextTime += std::chrono::duration_cast<std::chrono::microseconds>(nextEnd - nextStart).count();
+                    // 协作式停止检查
+                    if (ShouldStop()) break;
                     continue;
                 }
 
@@ -258,19 +272,26 @@ namespace {
                         if (!FindNextFileW(hFind, &findData)) break;
                         auto nextEnd = std::chrono::high_resolution_clock::now();
                         t_findNextTime += std::chrono::duration_cast<std::chrono::microseconds>(nextEnd - nextStart).count();
+                        // 协作式停止检查
+                        if (ShouldStop()) break;
                         continue;
                     }
                     
-                    // 将子目录加入队列
+                    // 将子目录加入队列（仅在未停止时）
                     {
                         std::lock_guard<std::mutex> lock(g_mutex);
-                        if (!g_stopRequested.load()) {
+                        if (!ShouldStop()) {
                             g_directoryQueue.push(fullPath);
                             g_outstandingDirs.fetch_add(1);
-                            g_directories.fetch_add(1);  // 原子增加目录计数
-                            g_cv.notify_one();           // 唤醒一个等待的工作线程
+                            g_directories.fetch_add(1);
+                            g_cv.notify_one();
                             dirsFound++;
                         }
+                    }
+                    
+                    // 协作式停止检查：添加目录后再次检查
+                    if (ShouldStop()) {
+                        break;
                     }
                 } 
                 // 处理文件
@@ -281,6 +302,8 @@ namespace {
                         if (!FindNextFileW(hFind, &findData)) break;
                         auto nextEnd = std::chrono::high_resolution_clock::now();
                         t_findNextTime += std::chrono::duration_cast<std::chrono::microseconds>(nextEnd - nextStart).count();
+                        // 协作式停止检查
+                        if (ShouldStop()) break;
                         continue;
                     }
 
@@ -294,6 +317,11 @@ namespace {
                     if (g_callback) {
                         auto cbStart = std::chrono::high_resolution_clock::now();
                         try {
+                            // 在调用回调前检查停止标志
+                            if (ShouldStop()) {
+                                break;
+                            }
+                            
                             // 调用回调函数，返回 false 表示停止扫描
                             bool shouldContinue = g_callback({fullPath, fileSize, lastModified, false});
                             if (!shouldContinue) {
@@ -301,13 +329,11 @@ namespace {
                                 break;
                             }
                         } catch (const std::exception& e) {
-                            // 捕获标准异常
                             std::wstringstream ss;
                             ss << L"[ScanDirectory] 回调异常: " << e.what() << L", file=[" << fullPath << L"]";
                             SetLastError(ss.str());
                             LOG(ss.str());
                         } catch (...) {
-                            // 捕获未知异常
                             std::wstringstream ss;
                             ss << L"[ScanDirectory] 回调未知异常, file=[" << fullPath << L"]";
                             SetLastError(ss.str());
@@ -323,6 +349,11 @@ namespace {
                     g_totalSize.fetch_add(fileSize);
                     filesScanned++;
                     bytesProcessed += fileSize;
+                }
+
+                // 协作式停止检查：在获取下一个文件前检查
+                if (ShouldStop()) {
+                    break;
                 }
 
                 // 获取下一个文件/目录
@@ -512,13 +543,18 @@ extern "C" {
             LOG(L"[StartScan] 根目录入队: [" + std::wstring(folderPath) + L"], 队列大小=1");
         }
 
-        // 获取 CPU 核心数，创建对应数量的工作线程
-        unsigned int numThreads = std::thread::hardware_concurrency();
-        if (numThreads == 0) { 
-            numThreads = 4; 
-            LOG(L"[StartScan] hardware_concurrency 返回 0, 回退到 4 线程"); 
-        } else { 
-            LOG(L"[StartScan] CPU 核心数=" + std::to_wstring(numThreads) + L", 创建 " + std::to_wstring(numThreads) + L" 个工作线程"); 
+        // 创建工作线程：优先使用 SetMaxWorkerThreads 设置的值
+        unsigned int numThreads = g_maxWorkerThreads.load(std::memory_order_relaxed);
+        if (numThreads == 0) {
+            numThreads = std::thread::hardware_concurrency();
+            if (numThreads == 0) {
+                numThreads = 4;
+                LOG(L"[StartScan] hardware_concurrency 返回 0, 回退到 4 线程");
+            } else {
+                LOG(L"[StartScan] CPU 核心数=" + std::to_wstring(numThreads) + L", 创建 " + std::to_wstring(numThreads) + L" 个工作线程");
+            }
+        } else {
+            LOG(L"[StartScan] 使用自定义线程数=" + std::to_wstring(numThreads));
         }
 
         // 创建工作线程
@@ -623,19 +659,31 @@ extern "C" {
         return DoStartScan(folderPath, progressCallback, extensions, excludeDirs);
     }
 
+    // 设置工作线程数（0 = 自动）
+    FILESCANNER_API void SetMaxWorkerThreads(unsigned int threadCount) {
+        g_maxWorkerThreads.store(threadCount, std::memory_order_relaxed);
+    }
+
     // 停止扫描
     FILESCANNER_API void StopScan() {
         // 设置停止标志
-        g_stopRequested.store(true);
-        // 唤醒所有等待的线程
-        g_cv.notify_all();
-        // 等待完成线程结束，确保资源清理完毕
+        g_stopRequested.store(true, std::memory_order_release);
+        
+        // 清空目录队列，让工作线程处理完当前目录后尽快退出
+        // 同时修正 outstanding 计数，避免被清掉的目录导致计数永久偏高
         {
-            std::lock_guard<std::mutex> lock(g_completionMutex);
-            if (g_completionThread.joinable()) {
-                g_completionThread.join();
+            std::lock_guard<std::mutex> lock(g_mutex);
+            const size_t clearedCount = g_directoryQueue.size();
+            while (!g_directoryQueue.empty()) {
+                g_directoryQueue.pop();
+            }
+            if (clearedCount > 0) {
+                g_outstandingDirs.fetch_sub(static_cast<int>(clearedCount));
             }
         }
+        
+        // 唤醒所有等待的线程
+        g_cv.notify_all();
     }
 
     // 获取扫描汇总结果
@@ -652,6 +700,11 @@ extern "C" {
     // 判断是否正在扫描
     FILESCANNER_API bool IsScanning() { 
         return g_isScanning.load(); 
+    }
+
+    // 判断是否已请求停止
+    FILESCANNER_API bool IsStopRequested() { 
+        return g_stopRequested.load(); 
     }
 
     // 获取最后一个错误信息

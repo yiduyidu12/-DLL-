@@ -8,3 +8,5 @@ EXPORTS
     PopScanError @6
     GetErrorCount @7
     StartScanEx @8
+    SetMaxWorkerThreads @9
+    IsStopRequested @10
