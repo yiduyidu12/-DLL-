@@ -53,7 +53,7 @@ namespace {
     std::atomic<unsigned long long> g_totalSize(0);    // 扫描到的文件总大小（字节）
     std::atomic<unsigned long long> g_directories(0);  // 扫描到的目录总数
     std::atomic<unsigned long long> g_scanTimeMs(0);   // 扫描耗时（毫秒）
-    std::atomic<unsigned long long> g_processedDirs(0); // 已处理的目录数（用于判断扫描是否完成）
+    std::atomic<int> g_outstandingDirs(0);             // 待处理目录数（队列中 + 正在扫描中）
 
     // 扫描进度回调函数指针，用于通知调用者每个扫描到的文件信息
     ScanProgressCallback g_callback = nullptr;
@@ -245,6 +245,10 @@ namespace {
                 
                 // 跳过当前目录(.)和上级目录(..)
                 if (name == L"." || name == L"..") {
+                    auto nextStart = std::chrono::high_resolution_clock::now();
+                    if (!FindNextFileW(hFind, &findData)) break;
+                    auto nextEnd = std::chrono::high_resolution_clock::now();
+                    t_findNextTime += std::chrono::duration_cast<std::chrono::microseconds>(nextEnd - nextStart).count();
                     continue;
                 }
 
@@ -275,10 +279,13 @@ namespace {
                     // 将子目录加入队列
                     {
                         std::lock_guard<std::mutex> lock(g_mutex);
-                        g_directoryQueue.push(fullPath);
-                        g_directories.fetch_add(1);  // 原子增加目录计数
-                        g_cv.notify_one();           // 唤醒一个等待的工作线程
-                        dirsFound++;
+                        if (!g_stopRequested.load()) {
+                            g_directoryQueue.push(fullPath);
+                            g_outstandingDirs.fetch_add(1);
+                            g_directories.fetch_add(1);  // 原子增加目录计数
+                            g_cv.notify_one();           // 唤醒一个等待的工作线程
+                            dirsFound++;
+                        }
                     }
                 } 
                 // 处理文件
@@ -370,9 +377,6 @@ namespace {
         // 关闭文件句柄
         FindClose(hFind);
         
-        // 增加已处理目录计数
-        g_processedDirs.fetch_add(1);
-        
         // 更新扫描耗时
         auto scanEnd = std::chrono::high_resolution_clock::now();
         t_totalScanTime += std::chrono::duration_cast<std::chrono::microseconds>(scanEnd - scanStart).count();
@@ -404,31 +408,13 @@ namespace {
                 {
                     std::unique_lock<std::mutex> lock(g_mutex);
                     
-                    // 如果队列为空且未收到停止请求，等待通知
-                    if (g_directoryQueue.empty() && !g_stopRequested.load()) {
-                        auto waitStart = std::chrono::high_resolution_clock::now();
-                        // 等待条件：队列非空 或 收到停止请求
-                        g_cv.wait(lock, [] { return !g_directoryQueue.empty() || g_stopRequested.load(); });
-                        auto waitEnd = std::chrono::high_resolution_clock::now();
-                        t_queueWaitTime += std::chrono::duration_cast<std::chrono::microseconds>(waitEnd - waitStart).count();
+                    // 如果队列为空，等待通知（扫描中由 ScanDirectory 唤醒，完成时由 completionThread 唤醒）
+                    while (g_directoryQueue.empty() && !g_stopRequested.load()) {
+                        g_cv.wait(lock);
                     }
                     
                     // 检查是否需要退出
                     if (g_stopRequested.load()) {
-                        break;
-                    }
-                    
-                    // 再次检查队列是否为空（可能被其他线程抢先取走）
-                    if (g_directoryQueue.empty()) {
-                        // 只有当所有目录都已处理完且队列为空时，才认为扫描完成
-                        // g_directories: 总目录数（包括已发现但未处理的）
-                        // g_processedDirs: 已处理的目录数
-                        // 当两者相等且队列为空时，表示所有目录都已扫描完毕
-                        if (g_processedDirs.load() >= g_directories.load()) {
-                            // 设置停止标志，让所有线程退出
-                            g_stopRequested.store(true);
-                            g_cv.notify_all();
-                        }
                         break;
                     }
                     
@@ -440,6 +426,16 @@ namespace {
                 // 扫描目录（不加锁执行耗时操作）
                 ScanDirectory(dir, threadId);
                 dirsProcessed++;
+                
+                // 待处理目录计数减一，检查是否全部完成
+                if (g_outstandingDirs.fetch_sub(1) == 1) {
+                    // 最后一个待处理目录被扫描完毕
+                    std::lock_guard<std::mutex> lock(g_mutex);
+                    if (g_directoryQueue.empty() && !g_stopRequested.load()) {
+                        g_stopRequested.store(true);
+                        g_cv.notify_all();
+                    }
+                }
             }
         } catch (const std::exception& e) {
             // 捕获致命异常，记录后重新抛出
@@ -512,7 +508,7 @@ extern "C" {
         g_totalFiles.store(0);
         g_totalSize.store(0);
         g_directories.store(1);  // 根目录算一个
-        g_processedDirs.store(0); // 已处理目录数初始化为0
+        g_outstandingDirs.store(1); // 根目录待处理
         g_scanTimeMs.store(0);
         g_callback = progressCallback;
         g_stopRequested.store(false);
@@ -580,12 +576,6 @@ extern "C" {
 
         // 创建完成线程：等待所有工作线程结束并汇总结果
         std::thread completionThread([]() {
-            size_t threadCount = 0;
-            {
-                std::lock_guard<std::mutex> lock(g_threadsMutex);
-                threadCount = g_threads.size();
-            }
-
             try {
                 // 等待所有工作线程结束
                 {

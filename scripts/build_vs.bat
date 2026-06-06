@@ -17,6 +17,8 @@ echo Linking FileScanner.dll...
 link.exe /DLL /OUT:bin\Release\FileScanner.dll obj\FileScanner\Release\Filter.obj obj\FileScanner\Release\FileScanner.obj kernel32.lib
 
 echo Build completed!
+copy /Y bin\Release\FileScanner.dll . >NUL
+copy /Y bin\Release\FileScanner.lib . >NUL
 dir /b bin\Release\FileScanner.dll
 
 endlocal
