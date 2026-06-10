@@ -10,3 +10,4 @@ EXPORTS
     StartScanEx @8
     SetMaxWorkerThreads @9
     IsStopRequested @10
+    EnableDebugLog @11

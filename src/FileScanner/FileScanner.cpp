@@ -75,7 +75,7 @@ namespace {
     // 过滤配置：用于扩展名过滤和目录排除
     ScanFilter g_filter;
 
-    // 日志开关（默认关闭，避免大量文件时日志成为性能瓶颈）
+    // 日志开关（默认关闭，调试时设为 true）
     std::atomic<bool> g_debugLog(false);
     
     // 完成通知线程：使用 joinable 而非 detach，避免僵尸线程
@@ -705,6 +705,11 @@ extern "C" {
     // 判断是否已请求停止
     FILESCANNER_API bool IsStopRequested() { 
         return g_stopRequested.load(); 
+    }
+
+    // 开关调试日志
+    FILESCANNER_API void EnableDebugLog(bool enable) {
+        g_debugLog.store(enable, std::memory_order_relaxed);
     }
 
     // 获取最后一个错误信息

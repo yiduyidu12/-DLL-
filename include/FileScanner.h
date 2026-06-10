@@ -53,4 +53,5 @@ extern "C" {
     FILESCANNER_API bool GetScanError(wchar_t* buf, size_t bufSize);
     FILESCANNER_API bool PopScanError(wchar_t* buf, size_t bufSize);
     FILESCANNER_API int GetErrorCount();
+    FILESCANNER_API void EnableDebugLog(bool enable);
 }
